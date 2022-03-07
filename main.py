@@ -1,3 +1,5 @@
+import ssl
+ssl._create_default_https_context = ssl._create_unverified_context
 import argparse
 import os
 import time
@@ -14,7 +16,8 @@ import torchvision
 import torchvision.transforms as transforms
 
 from models import *
-
+from loss import ConstastLoss
+from dataloader import BatchSampler
 
 parser = argparse.ArgumentParser(description='PyTorch Cifar10 Training')
 parser.add_argument('--epochs', default=200, type=int, metavar='N', help='number of total epochs to run')
@@ -26,7 +29,8 @@ parser.add_argument('--weight-decay', '--wd', default=1e-4, type=float, metavar=
 parser.add_argument('--print-freq', '-p', default=10, type=int, metavar='N', help='print frequency (default: 10)')
 parser.add_argument('--resume', default='', type=str, metavar='PATH', help='path to latest checkpoint (default: none)')
 parser.add_argument('-e', '--evaluate', dest='evaluate', action='store_true', help='evaluate model on validation set')
-parser.add_argument('-ct', '--cifar-type', default='10', type=int, metavar='CT', help='10 for cifar10,100 for cifar100 (default: 10)')
+parser.add_argument('-ct', '--cifar-type', default='100', type=int, metavar='CT', help='10 for cifar10,100 for cifar100 (default: 10)')
+parser.add_argument('--csr',default=True)
 
 best_prec = 0
 
@@ -41,9 +45,9 @@ def main():
         # model can be set to anyone that I have defined in models folder
         # note the model should match to the cifar type !
 
-        model = resnet20_cifar()
+        #model = resnet20_cifar()
         # model = resnet32_cifar()
-        # model = resnet44_cifar()
+        model = resnet44_cifar(num_classes=100)
         # model = resnet110_cifar()
         # model = preact_resnet110_cifar()
         # model = resnet164_cifar(num_classes=100)
@@ -60,7 +64,7 @@ def main():
         # mkdir a new folder to store the checkpoint and best model
         if not os.path.exists('result'):
             os.makedirs('result')
-        fdir = 'result/resnet20_cifar10'
+        fdir = 'result/resnet44_cifar100'
         if not os.path.exists(fdir):
             os.makedirs(fdir)
 
@@ -77,6 +81,7 @@ def main():
 
         model = nn.DataParallel(model).cuda()
         criterion = nn.CrossEntropyLoss().cuda()
+        CT_cri = ConstastLoss(4, 0.1)
         optimizer = optim.SGD(model.parameters(), args.lr, momentum=args.momentum, weight_decay=args.weight_decay)
         cudnn.benchmark = True
     else:
@@ -137,7 +142,8 @@ def main():
                 transforms.ToTensor(),
                 normalize,
             ]))
-        trainloader = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=2)
+        sampler = BatchSampler(train_dataset, args.batch_size, 4)
+        trainloader = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size, shuffle=False, num_workers=2)
 
         test_dataset = torchvision.datasets.CIFAR100(
             root='./data',
@@ -148,6 +154,8 @@ def main():
                 normalize,
             ]))
         testloader = torch.utils.data.DataLoader(test_dataset, batch_size=100, shuffle=False, num_workers=2)
+        
+        
 
     if args.evaluate:
         validate(testloader, model, criterion)
@@ -157,7 +165,7 @@ def main():
         adjust_learning_rate(optimizer, epoch, model_type)
 
         # train for one epoch
-        train(trainloader, model, criterion, optimizer, epoch)
+        train(trainloader, model, criterion, CT_cri, optimizer, epoch, False)
 
         # evaluate on test set
         prec = validate(testloader, model, criterion)
@@ -191,10 +199,11 @@ class AverageMeter(object):
         self.avg = self.sum / self.count
 
 
-def train(trainloader, model, criterion, optimizer, epoch):
+def train(trainloader, model, criterion, CT_cri, optimizer, epoch, do_csr = True):
     batch_time = AverageMeter()
     data_time = AverageMeter()
     losses = AverageMeter()
+    ct_losses = AverageMeter()
     top1 = AverageMeter()
 
     model.train()
@@ -207,17 +216,20 @@ def train(trainloader, model, criterion, optimizer, epoch):
         input, target = input.cuda(), target.cuda()
 
         # compute output
-        output = model(input)
-        loss = criterion(output, target)
+        output, fc_output = model(input)
+        loss = criterion(fc_output, target)
+        cont_loss = CT_cri(output)
+        total_loss = loss + cont_loss if do_csr else loss
 
         # measure accuracy and record loss
         prec = accuracy(output, target)[0]
         losses.update(loss.item(), input.size(0))
         top1.update(prec.item(), input.size(0))
+        ct_losses.update(cont_loss.item(), input.size(0))
 
         # compute gradient and do SGD step
         optimizer.zero_grad()
-        loss.backward()
+        total_loss.backward()
         optimizer.step()
 
         # measure elapsed time
@@ -229,9 +241,10 @@ def train(trainloader, model, criterion, optimizer, epoch):
                   'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
                   'Data {data_time.val:.3f} ({data_time.avg:.3f})\t'
                   'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
+                  'Const Loss {ct_loss.val:.4f} ({ct_loss.avg:.4f}\t'
                   'Prec {top1.val:.3f}% ({top1.avg:.3f}%)'.format(
                    epoch, i, len(trainloader), batch_time=batch_time,
-                   data_time=data_time, loss=losses, top1=top1))
+                   data_time=data_time, loss=losses, ct_loss=ct_losses, top1=top1))
 
 
 def validate(val_loader, model, criterion):
@@ -248,8 +261,8 @@ def validate(val_loader, model, criterion):
             input, target = input.cuda(), target.cuda()
 
             # compute output
-            output = model(input)
-            loss = criterion(output, target)
+            output, fc_output = model(input)
+            loss = criterion(fc_output, target)
 
             # measure accuracy and record loss
             prec = accuracy(output, target)[0]

@@ -207,9 +207,9 @@ class ResNet_Cifar(nn.Module):
 
         x = self.avgpool(x)
         x = x.view(x.size(0), -1)
-        x = self.fc(x)
+        fc_x = self.fc(x)
 
-        return x
+        return x, fc_x
 
 
 class PreAct_ResNet_Cifar(nn.Module):
